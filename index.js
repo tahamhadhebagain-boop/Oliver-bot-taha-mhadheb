@@ -198,50 +198,38 @@ const { sleep } = require('../utils/time');
 
 module.exports = [
   {
-    name: 'spam', aliases: ['sp', 'سبام'], category: 'auto', usage: '.spam <message> <seconds>s [count]',
-    summary: { en: 'Repeat a short announcement with limits' }, description: { ar: 'يرسل إعلاناً متكرراً بعد فاصل محدد، بعدد محدود فقط، ويمكن إيقافه.', en: 'Repeats an announcement at a chosen interval with a strict count limit and a stop command.' },
-    off: '.unsp',
+    name: 'spam', aliases: ['sp', 'سبام'], category: 'auto', usage: '.spam <message> <seconds>',
+    summary: { en: 'Repeat a group message until stopped' }, description: { ar: 'يرسل الرسالة كل عدد الثواني المحدد باستمرار حتى إيقافها بالأمر .uns أو .rest.', en: 'Sends the message at the selected interval until .uns or .rest is used.' },
+    off: '.uns / .rest',
     handler: async ctx => {
       const tokens = ctx.argsText.split(/\s+/).filter(Boolean);
-      if (tokens.length < 2) return ctx.reply(error('Usage: .spam <message> <seconds>s [count]'));
-      let count = ctx.config.maxRepeatCount;
-      let intervalIndex = tokens.length - 1;
-      const lastAsCount = Number(tokens[tokens.length - 1]);
-      if (Number.isInteger(lastAsCount) && lastAsCount > 0 && tokens.length >= 3) {
-        count = Math.min(ctx.config.maxRepeatCount, lastAsCount);
-        intervalIndex = tokens.length - 2;
-      }
-      const secondsToken = tokens[intervalIndex].match(/^(\d+)s?$/i);
-      if (!secondsToken) return ctx.reply(error('Add an interval, for example: .spam Meeting starts soon 30s 3'));
-      const seconds = Number(secondsToken[1]);
-      const messageTokens = tokens.slice(0, intervalIndex);
-      const message = messageTokens.join(' ').trim();
+      if (tokens.length < 2) return ctx.reply(error('Usage: .spam <message> <seconds>'));
+      const interval = tokens.pop().match(/^(\d+)s?$/i);
+      if (!interval) return ctx.reply(error('Put the interval in seconds at the end. Example: .spam Hello everyone 5'));
+      const seconds = Number(interval[1]);
+      if (!Number.isSafeInteger(seconds) || seconds < 5) return ctx.reply(error('The minimum interval is 5 seconds.'));
+      const message = tokens.join(' ').trim();
       if (!message) return ctx.reply(error('The repeated message cannot be empty.'));
-      if (seconds < ctx.config.minRepeatIntervalSeconds) return ctx.reply(error(`The minimum interval is ${ctx.config.minRepeatIntervalSeconds} seconds.`));
       ctx.jobs.cancel(ctx.threadID, 'repeat');
-      let remaining = count;
+      let sending = false;
       const timer = setInterval(async () => {
-        try {
-          if (remaining <= 0 || ctx.db.get('locked')) { ctx.jobs.cancel(ctx.threadID, 'repeat'); return; }
-          remaining -= 1;
-          await ctx.reply(message);
-          if (remaining <= 0) {
-            ctx.jobs.cancel(ctx.threadID, 'repeat');
-            await ctx.reply(frame('𝖠𝗎𝗍𝗈 ᚲ', 'Announcement schedule completed.'));
-          }
-        } catch (err) {
+        if (sending) return;
+        if (ctx.db.get('locked')) { ctx.jobs.cancel(ctx.threadID, 'repeat'); return; }
+        sending = true;
+        try { await ctx.reply(message); }
+        catch (err) {
           ctx.jobs.cancel(ctx.threadID, 'repeat');
           ctx.logger.error('Scheduled announcement failed', { error: err.message, threadID: ctx.threadID });
-        }
+        } finally { sending = false; }
       }, seconds * 1000);
       timer.unref?.();
       ctx.jobs.set(ctx.threadID, 'repeat', timer);
-      return ctx.reply(success('Announcement scheduled', `Interval : ${seconds}s\nMaximum repetitions : ${count}\nStop : .unsp`));
+      return ctx.reply(success('Continuous announcement started', `Interval : ${seconds}s\nStop : .uns or .rest`));
     },
   },
   {
-    name: 'unsp', aliases: ['spoff', 'spstop', 'سبام ايقاف', 'سبام إيقاف'], category: 'auto', usage: '.unsp',
-    summary: { en: 'Stop scheduled announcement' }, description: { ar: 'يوقف التكرار المجدول في المجموعة.', en: 'Cancels the repeating announcement in this group.' },
+    name: 'unsp', aliases: ['uns', 'spoff', 'spstop', 'سبام ايقاف', 'سبام إيقاف'], category: 'auto', usage: '.uns',
+    summary: { en: 'Stop scheduled announcement' }, description: { ar: 'يوقف التكرار المستمر في المجموعة.', en: 'Cancels the repeating announcement in this group.' },
     handler: async ctx => {
       const stopped = ctx.jobs.cancel(ctx.threadID, 'repeat');
       return ctx.reply(stopped ? success('Announcement stopped') : frame('𝖠𝗎𝗍𝗈', 'No active repeat job in this group.'));
