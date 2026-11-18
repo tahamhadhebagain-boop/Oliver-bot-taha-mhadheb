@@ -1,5 +1,5 @@
 // TAHA BOT - single-file bundle generated from the original modular source.
-// Media V6: Openverse multi-field search, Audius CC-label support, ccMixter, and provider diagnostics.
+// Media V6 + protection fixes + FCA session snapshot and MQTT recovery supervision.
 // Keep package.json beside this file. Media files are sent only when the source permits downloading and redistribution.
 'use strict';
 
@@ -12,7 +12,7 @@ const __modules = {
 const http = require('node:http');
 const { config, validateConfig } = require('./src/config');
 const { Database } = require('./src/systems/database');
-const { connectMessenger } = require('./src/systems/fca');
+const { connectMessenger, apiCall } = require('./src/systems/fca');
 const { JobManager } = require('./src/systems/jobs');
 const { startProtectionMonitor } = require('./src/systems/monitor');
 const { handleIncoming } = require('./src/systems/dispatcher');
@@ -22,18 +22,115 @@ const logger = require('./src/utils/logger');
 async function main() {
   validateConfig();
   const db = new Database(process.env.DB_FILE || 'data/store.json');
-  const { api, mqtt, currentUserID, saveAppState } = await connectMessenger(config);
+  const { api, currentUserID, saveAppState } = await connectMessenger(config);
   const jobs = new JobManager();
   const ctxState = { maxLatency: 0 };
-  let connected = true;
+  let mqtt = null;
+  let connected = false;
   let stopping = false;
+  let authenticationRequired = false;
+  let mqttRecoveryTimer = null;
+  let mqttRecoveryAttempts = 0;
+  const MAX_MQTT_RECOVERY_ATTEMPTS = 5;
   const seenMessageIDs = new Map();
+
+  function isAuthenticationError(value) {
+    const message = String(value?.message || value?.error || value || '');
+    return /1357001|not logged in|login approval|login-approval|review recent login|review-recent-login|checkpoint|authentication required|session expired|invalid session|auth failure/i.test(message);
+  }
+
+  function markAuthenticationRequired(reason) {
+    authenticationRequired = true;
+    connected = false;
+    if (mqttRecoveryTimer) clearTimeout(mqttRecoveryTimer);
+    mqttRecoveryTimer = null;
+    logger.error('Facebook no longer accepts the saved session. MQTT recovery is paused; account-owner verification or a newly authenticated AppState is required.', {
+      error: String(reason?.message || reason || 'Authentication rejected'),
+    });
+  }
+
+  function scheduleMqttRecovery(reason) {
+    if (stopping || authenticationRequired || mqttRecoveryTimer) return;
+    connected = false;
+    if (mqttRecoveryAttempts >= MAX_MQTT_RECOVERY_ATTEMPTS) {
+      logger.error('MQTT recovery limit reached. The bot will keep the service process alive without creating duplicate listeners.', {
+        attempts: mqttRecoveryAttempts,
+        error: String(reason?.message || reason || 'MQTT disconnected'),
+      });
+      return;
+    }
+
+    const delaySeconds = Math.min(600, config.mqttReconnectGraceSeconds * (2 ** mqttRecoveryAttempts));
+    logger.warn('MQTT is disconnected. The FCA library will try autoReconnect first; a single-listener recovery is scheduled as a fallback.', {
+      retryInSeconds: delaySeconds,
+      attempt: mqttRecoveryAttempts + 1,
+      error: String(reason?.message || reason || 'MQTT disconnected'),
+    });
+
+    mqttRecoveryTimer = setTimeout(async () => {
+      mqttRecoveryTimer = null;
+      if (stopping || authenticationRequired || connected) return;
+      const previous = mqtt;
+      try {
+        if (!previous || (typeof previous.stopListening !== 'function' && typeof previous.stopListeningAsync !== 'function')) {
+          throw new Error('This FCA listener does not expose a stop method; refusing to create a second MQTT listener.');
+        }
+        if (typeof previous.stopListeningAsync === 'function') await previous.stopListeningAsync();
+        else await Promise.resolve(previous.stopListening());
+
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const replacement = api.listenMqtt();
+        if (!replacement || typeof replacement.on !== 'function') {
+          throw new Error('FCA listenMqtt() did not return a valid EventEmitter during recovery.');
+        }
+        mqtt = replacement;
+        mqttRecoveryAttempts += 1;
+        attachMqttListeners(mqtt);
+        logger.warn('A replacement MQTT listener was started using the existing authenticated FCA session.', {
+          attempt: mqttRecoveryAttempts,
+        });
+      } catch (err) {
+        logger.error('MQTT listener recovery failed.', { error: err.message, attempt: mqttRecoveryAttempts + 1 });
+        scheduleMqttRecovery(err);
+      }
+    }, delaySeconds * 1000);
+    mqttRecoveryTimer.unref?.();
+  }
+
+  function attachMqttListeners(listener) {
+    listener.on('message', event => {
+      onEvent(event).catch(err => logger.error('Incoming message handler failed', { error: err.message }));
+    });
+    listener.on('message_reply', event => {
+      onEvent(event).catch(err => logger.error('Reply handler failed', { error: err.message }));
+    });
+    listener.on('event', event => {
+      if (event?.threadID) db.touchThread(event.threadID).catch(err => logger.warn('Could not track thread', { error: err.message }));
+    });
+    listener.on('error', err => {
+      const message = String(err?.message || err || 'Unknown MQTT error');
+      logger.error('Messenger MQTT error', { error: message });
+      if (isAuthenticationError(err)) markAuthenticationRequired(err);
+      else scheduleMqttRecovery(err);
+    });
+    listener.on('close', () => scheduleMqttRecovery(new Error('MQTT close event')));
+    listener.on('offline', () => scheduleMqttRecovery(new Error('MQTT offline event')));
+    listener.on('ready', () => {
+      if (authenticationRequired) return;
+      connected = true;
+      mqttRecoveryAttempts = 0;
+      if (mqttRecoveryTimer) clearTimeout(mqttRecoveryTimer);
+      mqttRecoveryTimer = null;
+      logger.info('Messenger realtime connection is ready.');
+      saveAppState('mqtt-ready').catch(err => logger.warn('Could not persist AppState after Messenger became ready.', { error: err.message }));
+    });
+  }
 
   const server = http.createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
       const payload = {
         service: 'TAHA BOT',
-        status: connected ? 'online' : 'degraded',
+        status: authenticationRequired ? 'authentication_required' : (connected ? 'online' : 'degraded'),
         uptimeSeconds: Math.floor(process.uptime()),
         locked: Boolean(db.get('locked')),
         maintenance: Boolean(db.get('maintenance')),
@@ -67,33 +164,29 @@ async function main() {
     });
   }
 
-  mqtt.on('message', event => { onEvent(event).catch(err => logger.error('Incoming message handler failed', { error: err.message })); });
-  mqtt.on('message_reply', event => { onEvent(event).catch(err => logger.error('Reply handler failed', { error: err.message })); });
-  mqtt.on('event', event => {
-    // Thread updates are observed by the periodic reconciliation worker.
-    if (event?.threadID) db.touchThread(event.threadID).catch(err => logger.warn('Could not track thread', { error: err.message }));
-  });
-  mqtt.on('error', err => {
-    connected = false;
-    const message = String(err?.message || err || 'Unknown MQTT error');
-    logger.error('Messenger MQTT error', { error: message });
-    if (/not logged in|login approval|review recent login|checkpoint|authentication|auth failure/i.test(message)) {
-      logger.error('Facebook rejected the current session. The bot cannot safely create a replacement AppState without account-owner authentication. Review the Facebook security prompt, then replace FB_APPSTATE_JSON in Railway if required.');
-    }
-  });
-  mqtt.on('close', () => { connected = false; logger.warn('Messenger MQTT connection closed; the adapter will attempt automatic reconnection.'); });
-  mqtt.on('offline', () => { connected = false; logger.warn('Messenger MQTT is offline; waiting for the adapter to reconnect.'); });
-  mqtt.on('ready', () => {
-    connected = true;
-    logger.info('Messenger realtime connection is ready.');
-    saveAppState('mqtt-ready').catch(err => logger.warn('Could not persist AppState after Messenger became ready.', { error: err.message }));
-  });
+  mqtt = api.listenMqtt();
+  if (!mqtt || typeof mqtt.on !== 'function') throw new Error('Could not start the Messenger realtime listener.');
+  attachMqttListeners(mqtt);
 
-  const appStateSaveTimer = setInterval(() => {
-    if (!connected || stopping) return;
-    saveAppState('periodic').catch(err => logger.warn('Periodic AppState persistence failed.', { error: err.message }));
-  }, config.appStateSaveIntervalMinutes * 60 * 1000);
-  appStateSaveTimer.unref?.();
+  // Do not overwrite the last good AppState merely because a timer fired.
+  // Save cookies only after an authenticated request succeeds or MQTT becomes ready.
+  let heartbeatRunning = false;
+  const sessionHeartbeatTimer = setInterval(async () => {
+    if (stopping || heartbeatRunning || authenticationRequired) return;
+    heartbeatRunning = true;
+    try {
+      // getThreadList(limit, timestamp, tags) performs a real authenticated request.
+      await apiCall(api, 'getThreadList', 1, null, []);
+      await saveAppState('authenticated-session-heartbeat');
+      logger.info('Facebook session heartbeat succeeded; the latest FCA cookies were saved.');
+    } catch (err) {
+      if (isAuthenticationError(err)) markAuthenticationRequired(err);
+      else logger.warn('Facebook session heartbeat failed; keeping the last valid AppState and retrying later.', { error: err.message });
+    } finally {
+      heartbeatRunning = false;
+    }
+  }, config.sessionHeartbeatMinutes * 60 * 1000);
+  sessionHeartbeatTimer.unref?.();
 
   logger.info('TAHA BOT started.', {
     currentUserID: currentUserID || 'unknown',
@@ -107,14 +200,15 @@ async function main() {
     stopping = true;
     logger.info(`Shutting down after ${signal}.`);
     jobs.cancelAll();
-    clearInterval(appStateSaveTimer);
+    clearInterval(sessionHeartbeatTimer);
+    if (mqttRecoveryTimer) clearTimeout(mqttRecoveryTimer);
     stopMonitor();
     await saveAppState('shutdown').catch(err => logger.warn('Could not persist AppState during shutdown.', { error: err.message }));
     await db.save().catch(() => {});
     server.close();
     try {
-      if (typeof mqtt.stopListening === 'function') mqtt.stopListening();
-      else if (typeof mqtt.stopListeningAsync === 'function') await mqtt.stopListeningAsync();
+      if (mqtt && typeof mqtt.stopListeningAsync === 'function') await mqtt.stopListeningAsync();
+      else if (mqtt && typeof mqtt.stopListening === 'function') await Promise.resolve(mqtt.stopListening());
     } catch { /* best effort */ }
     process.exit(0);
   }
@@ -1945,26 +2039,70 @@ const { getTargetID } = require('../utils/parser');
 const { apiCall } = require('../systems/fca');
 const { sleep } = require('../utils/time');
 
-function nickMapFromInfo(info) {
-  const source = info?.nicknames || info?.participantNicknames || {};
-  if (source instanceof Map) return Object.fromEntries(source.entries());
-  return source && typeof source === 'object' ? source : {};
+function memberIDsFromInfo(info) {
+  const source = Array.isArray(info?.participantIDs)
+    ? info.participantIDs
+    : (Array.isArray(info?.participants) ? info.participants : []);
+  return [...new Set(source
+    .map(item => typeof item === 'object' && item !== null
+      ? (item.userID || item.userid || item.id)
+      : item)
+    .filter(Boolean)
+    .map(String))];
 }
 
+function nicknameFromCommand(ctx) {
+  let phrase = String(ctx.argsText || ctx.args?.join(' ') || '').trim();
+  if (!phrase) return '';
+
+  const reply = ctx.event?.messageReply || ctx.event?.replyMessage || ctx.event?.message_reply;
+  if (reply?.senderID || reply?.author || reply?.userID) return phrase;
+
+  // FCA exposes mentions as { userID: displayName }. Remove the tag itself,
+  // leaving only the nickname text supplied after it.
+  const source = ctx.event?.mentions;
+  const values = Array.isArray(source) ? source : (source && typeof source === 'object' ? Object.values(source) : []);
+  for (const value of values) {
+    const rawName = typeof value === 'string' ? value : (value?.name || value?.tag || value?.userName || '');
+    const name = String(rawName || '').trim().replace(/^@/, '');
+    if (!name) continue;
+    const candidates = [`@${name}`, name];
+    for (const candidate of candidates) {
+      const at = phrase.toLocaleLowerCase().indexOf(candidate.toLocaleLowerCase());
+      if (at >= 0) {
+        phrase = `${phrase.slice(0, at)} ${phrase.slice(at + candidate.length)}`;
+        break;
+      }
+    }
+  }
+
+  // Fallback for adapters which provide a mention ID but no display-name map.
+  phrase = phrase.replace(/^@\S+\s*/, '');
+  return phrase.replace(/\s+/g, ' ').trim();
+}
+
+function nicknameProtectionFor(g) {
+  if (!g.nickProtection || typeof g.nickProtection !== 'object') {
+    g.nickProtection = { enabled: false, mode: 'snapshot', members: {}, managedMembers: [], allowPrimary: false };
+  }
+  if (!g.nickProtection.members || typeof g.nickProtection.members !== 'object') g.nickProtection.members = {};
+  if (!Array.isArray(g.nickProtection.managedMembers)) g.nickProtection.managedMembers = [];
+  return g.nickProtection;
+}
 
 module.exports = [
   {
-    name: 'name', aliases: ['nam', 'نيم', 'اسم', 'إسم'], category: 'protection', usage: '.name',
-    summary: { en: 'Protect the group name' }, description: { ar: 'يحفظ اسم المجموعة الحالي ويعيده عند تغييره إذا نجح فحص الحماية.', en: 'Stores the current group title and periodically restores it when changed, where supported.' },
+    name: 'name', aliases: ['nam', 'nm', 'نيم', 'اسم', 'إسم'], category: 'protection', usage: '.nam <group name>',
+    summary: { en: 'Set and protect the group name' }, description: { ar: 'يعيّن اسم المجموعة الذي تكتبه ويحفظه، ثم يعيده تلقائياً كلما غُيّر أو حُذف.', en: 'Sets the supplied group title, stores it, and restores it whenever it is changed or removed.' },
     off: '.nameoff',
     handler: async ctx => {
-      const info = await apiCall(ctx.api, 'getThreadInfo', ctx.threadID);
-      const title = info?.threadName || info?.name;
-      if (!title) return ctx.reply(error('Could not read this group title.'));
+      const title = String(ctx.argsText || ctx.args?.join(' ') || '').trim();
+      if (!title) return ctx.reply(error('Usage: .nam <group name>'));
       const g = ctx.db.group(ctx.threadID);
       g.nameProtection = { enabled: true, protectedName: title };
       await ctx.db.save();
-      return ctx.reply(success('Name protection enabled', `Protected name : ${title}`));
+      await apiCall(ctx.api, 'setTitle', title, ctx.threadID);
+      return ctx.reply(success('Group name protected', `Protected name : ${title}\nAutomatic restoration : ACTIVE`));
     },
   },
   {
@@ -1976,78 +2114,141 @@ module.exports = [
     },
   },
   {
-    name: 'nicks', aliases: ['nicknames', 'كنيات'], category: 'protection', usage: '.nicks | .nicks change <nickname>',
-    summary: { en: 'Protect all member nicknames' }, description: { ar: 'يحفظ الكنيات الحالية ويحاول استعادتها. أضف change ثم الكنية لتعيينها بالتتابع بفاصل ثانيتين.', en: 'Snapshots all current nicknames. Use “change <text>” to set the same nickname sequentially with a two-second gap.' },
-    off: '.nicksoff',
+    name: 'nicks', aliases: ['nicknames', 'كنيات'], category: 'protection', usage: '.nicks <nickname>',
+    summary: { en: 'Set and protect all member nicknames' }, description: { ar: 'يضع الكنية التي تكتبها لجميع أعضاء المجموعة ويحميها؛ يعيدها إذا غُيّرت أو حُذفت.', en: 'Sets the supplied nickname for all group members and restores it whenever it is changed or removed.' },
+    off: '.unicks / .nicksoff',
+    handler: async ctx => {
+      const nickname = String(ctx.argsText || ctx.args?.join(' ') || '').trim();
+      if (!nickname) return ctx.reply(error('Usage: .nicks <nickname>'));
+
+      const info = await apiCall(ctx.api, 'getThreadInfo', ctx.threadID);
+      const allMembers = memberIDsFromInfo(info);
+      const members = allMembers.filter(id =>
+        id !== String(ctx.currentUserID || '')
+        && (ctx.isPrimary || id !== String(ctx.primaryDeveloperId || ''))
+      );
+      if (!members.length) return ctx.reply(error('Could not read any eligible group members.'));
+
+      const g = ctx.db.group(ctx.threadID);
+      g.nickProtection = {
+        enabled: true,
+        mode: 'uniform',
+        members: Object.fromEntries(members.map(id => [id, nickname])),
+        managedMembers: members.slice(),
+        allowPrimary: Boolean(ctx.isPrimary),
+      };
+      await ctx.db.save();
+
+      let changed = 0;
+      const failed = [];
+      for (let i = 0; i < members.length; i += 1) {
+        const id = members[i];
+        try {
+          await apiCall(ctx.api, 'changeNickname', nickname, ctx.threadID, id);
+          changed += 1;
+        } catch {
+          failed.push(id);
+        }
+        if (i < members.length - 1) await sleep(800);
+      }
+
+      const details = [
+        `Nickname : ${nickname}`,
+        `Updated : ${changed}/${members.length} members`,
+        'Nickname protection : ACTIVE',
+        failed.length ? `Initial update failures : ${failed.length} (the monitor will retry)` : 'All selected members updated successfully',
+      ].join('\n');
+      return ctx.reply(success('All member nicknames protected', details));
+    },
+  },
+  {
+    name: 'nicksoff', aliases: ['unicks', 'unickes', 'nicksstop', 'كنيات ايقاف', 'كنيات إيقاف', 'ايقاف كنيات', 'إيقاف كنيات'], category: 'protection', usage: '.unicks / .nicksoff',
+    summary: { en: 'Remove bot-set nicknames and disable all nickname protection' }, description: { ar: 'يمسح الكنيات التي عيّنها البوت لجميع الأعضاء ثم يوقف حمايتها.', en: 'Clears the nicknames set by the bot for all managed members, then disables nickname protection.' },
     handler: async ctx => {
       const g = ctx.db.group(ctx.threadID);
-      const info = await apiCall(ctx.api, 'getThreadInfo', ctx.threadID);
-      const members = (info?.participantIDs || []).map(String);
-      const phrase = ctx.args[0] && ['change', 'ch', 'تغيير'].includes(ctx.args[0].toLowerCase()) ? ctx.args.slice(1).join(' ').trim() : '';
-      const old = nickMapFromInfo(info);
-      const protectedMembers = {};
-      for (const id of members) {
-        // Empty nicknames are also protected: a later nickname change should be reset.
-        protectedMembers[id] = phrase || old[id] || '';
+      const protection = nicknameProtectionFor(g);
+      const managed = new Set(protection.managedMembers.map(String));
+      // Older uniform mode was only enabled when the bot had set one nickname for everyone.
+      if (protection.mode === 'uniform') {
+        for (const id of Object.keys(protection.members)) managed.add(String(id));
       }
-      g.nickProtection = { enabled: true, mode: phrase ? 'uniform' : 'snapshot', members: protectedMembers };
+      const targets = [...managed].filter(id =>
+        id !== String(ctx.currentUserID || '')
+        && (id !== String(ctx.primaryDeveloperId || '') || protection.allowPrimary === true)
+      );
+
+      // Disable the monitor before clearing so it cannot restore the nicknames being removed.
+      g.nickProtection = { enabled: false, mode: 'snapshot', members: {}, managedMembers: [], allowPrimary: false };
       await ctx.db.save();
-      if (phrase) {
-        let changed = 0;
-        let completed = false;
-        const controller = new AbortController();
-        ctx.jobs.set(ctx.threadID, 'nicks-change', { cancel: () => controller.abort() });
-        for (const id of members) {
-          if (controller.signal.aborted) break;
-          if (id === ctx.currentUserID || id === ctx.primaryDeveloperId) continue;
-          await apiCall(ctx.api, 'changeNickname', phrase, ctx.threadID, id);
-          changed += 1;
-          await sleep(2000);
+
+      let cleared = 0;
+      const failed = [];
+      for (let i = 0; i < targets.length; i += 1) {
+        const id = targets[i];
+        try {
+          await apiCall(ctx.api, 'changeNickname', '', ctx.threadID, id);
+          cleared += 1;
+        } catch {
+          failed.push(id);
         }
-        completed = !controller.signal.aborted;
-        ctx.jobs.cancel(ctx.threadID, 'nicks-change');
-        const stopped = !completed;
-        return ctx.reply(success(stopped ? 'Nickname update paused' : 'Nickname protection enabled', `Updated ${changed} members.\nNickname : ${phrase}\nRestoration monitor : ACTIVE`));
+        if (i < targets.length - 1) await sleep(500);
       }
-      return ctx.reply(success('Nickname protection enabled', `Saved ${Object.keys(protectedMembers).length} member nickname states.`));
+
+      return ctx.reply(success('All nickname protection disabled', `Nicknames cleared : ${cleared}/${targets.length}${failed.length ? `\nCould not clear : ${failed.length}` : ''}`));
     },
   },
   {
-    name: 'nicksoff', aliases: ['unicks', 'unickes', 'nicksstop', 'كنيات ايقاف', 'كنيات إيقاف', 'ايقاف كنيات', 'إيقاف كنيات'], category: 'protection', usage: '.nicksoff',
-    summary: { en: 'Disable all nickname protection' }, description: { ar: 'يوقف حماية كل الكنيات التي حفظها البوت أو غيّرها.', en: 'Disables every nickname protection rule saved by the bot.' },
+    name: 'nick', aliases: ['كنية'], category: 'protection', usage: '.nick <nickname> (reply to a member) | .nick @member <nickname>',
+    summary: { en: 'Set and protect one member nickname' }, description: { ar: 'يضع الكنية التي تكتبها للعضو الذي ترد على رسالته أو تشير إليه، ويحميها من التغيير والحذف.', en: 'Sets the supplied nickname for the replied-to or mentioned member and protects it from changes or deletion.' },
+    off: '.unick / .nickoff (reply to the member or mention them)',
     handler: async ctx => {
-      const g = ctx.db.group(ctx.threadID); g.nickProtection = { enabled: false, mode: 'snapshot', members: {} }; await ctx.db.save();
-      return ctx.reply(success('All nickname protection disabled'));
-    },
-  },
-  {
-    name: 'nick', aliases: ['كنية'], category: 'protection', usage: '.nick @member [new nickname] (or reply)',
-    summary: { en: 'Protect one member nickname' }, description: { ar: 'يحمي كنية عضو واحد، ويمكن إضافة نص لتغيير كنيته ثم حمايتها.', en: 'Protects one selected member nickname; optional text sets the nickname first.' },
-    off: '.unick @member',
-    handler: async ctx => {
-      const target = getTargetID(ctx, ctx.args[0]);
-      if (!target) return ctx.reply(error('Reply to a member or mention them.'));
-      if (target === ctx.primaryDeveloperId && !ctx.isPrimary) return ctx.reply(error('The primary developer is protected.'));
-      const replyNick = ctx.args.join(' ').replace(/^@\S+\s*/, '').trim();
-      let nickname = replyNick;
-      if (nickname) await apiCall(ctx.api, 'changeNickname', nickname, ctx.threadID, target);
-      else {
-        const info = await apiCall(ctx.api, 'getThreadInfo', ctx.threadID);
-        nickname = nickMapFromInfo(info)[target] || '';
+      const target = getTargetID(ctx, ctx.args?.[0]);
+      if (!target) return ctx.reply(error('Reply to the member or mention them.'));
+      if (String(target) === String(ctx.primaryDeveloperId) && !ctx.isPrimary) {
+        return ctx.reply(error('The primary developer is protected.'));
       }
-      if (!nickname) return ctx.reply(error('Could not read the nickname. Supply a nickname after the command.'));
-      const g = ctx.db.group(ctx.threadID); g.nickProtection.enabled = true; g.nickProtection.members[target] = nickname; await ctx.db.save();
-      return ctx.reply(success('Member nickname protected', `Nickname : ${nickname}\nMember ID : ${target}`));
+
+      const nickname = nicknameFromCommand(ctx);
+      if (!nickname) {
+        return ctx.reply(error('Usage: reply to a member with .nick <nickname>, or use .nick @member <nickname>.'));
+      }
+
+      const g = ctx.db.group(ctx.threadID);
+      const protection = nicknameProtectionFor(g);
+      protection.enabled = true;
+      protection.members[String(target)] = nickname;
+      protection.managedMembers = [...new Set([...protection.managedMembers.map(String), String(target)])];
+      if (protection.mode !== 'uniform') protection.mode = 'managed';
+      if (String(target) === String(ctx.primaryDeveloperId)) protection.allowPrimary = Boolean(ctx.isPrimary);
+      await ctx.db.save();
+
+      await apiCall(ctx.api, 'changeNickname', nickname, ctx.threadID, String(target));
+      return ctx.reply(success('Member nickname protected', `Nickname : ${nickname}\nMember ID : ${target}\nRestoration : ACTIVE`));
     },
   },
   {
-    name: 'unick', aliases: ['nickoff', 'كنية ايقاف', 'كنية إيقاف'], category: 'protection', usage: '.unick @member (or reply)',
-    summary: { en: 'Disable one nickname rule' }, description: { ar: 'يزيل حماية كنية العضو المحدد.', en: 'Removes the saved nickname protection for one member.' },
+    name: 'unick', aliases: ['nickoff', 'كنية ايقاف', 'كنية إيقاف'], category: 'protection', usage: '.unick / .nickoff (reply to the member or mention them)',
+    summary: { en: 'Clear one member nickname and disable its protection' }, description: { ar: 'يمسح كنية العضو المحدد التي يديرها البوت ويوقف حمايتها.', en: 'Clears the selected member nickname and removes its protection rule.' },
     handler: async ctx => {
-      const target = getTargetID(ctx, ctx.args[0]); if (!target) return ctx.reply(error('Reply to a member or mention them.'));
-      const g = ctx.db.group(ctx.threadID); delete g.nickProtection.members[target];
-      if (!Object.keys(g.nickProtection.members).length) g.nickProtection.enabled = false;
-      await ctx.db.save(); return ctx.reply(success('Nickname protection removed', `Member ID : ${target}`));
+      const target = getTargetID(ctx, ctx.args?.[0]);
+      if (!target) return ctx.reply(error('Reply to the member or mention them.'));
+      if (String(target) === String(ctx.primaryDeveloperId) && !ctx.isPrimary) {
+        return ctx.reply(error('The primary developer is protected.'));
+      }
+
+      const g = ctx.db.group(ctx.threadID);
+      const protection = nicknameProtectionFor(g);
+      delete protection.members[String(target)];
+      protection.managedMembers = protection.managedMembers.filter(id => String(id) !== String(target));
+      protection.enabled = Object.keys(protection.members).length > 0;
+      if (String(target) === String(ctx.primaryDeveloperId)) protection.allowPrimary = false;
+      if (!protection.enabled) {
+        g.nickProtection = { enabled: false, mode: 'snapshot', members: {}, managedMembers: [], allowPrimary: false };
+      }
+      await ctx.db.save();
+
+      await apiCall(ctx.api, 'changeNickname', '', ctx.threadID, String(target));
+      return ctx.reply(success('Member nickname cleared', `Member ID : ${target}\nNickname protection : OFF`));
     },
   },
   {
@@ -2118,7 +2319,8 @@ const config = {
   primaryDeveloperId: String(process.env.PRIMARY_DEVELOPER_ID || '').trim(),
   appStateJson: String(process.env.FB_APPSTATE_JSON || '').trim(),
   appStateFile: process.env.APPSTATE_FILE || 'data/appstate.json',
-  appStateSaveIntervalMinutes: Math.max(1, Math.min(60, Number(process.env.APPSTATE_SAVE_INTERVAL_MINUTES) || 5)),
+  sessionHeartbeatMinutes: Math.max(1, Math.min(30, Number(process.env.SESSION_HEARTBEAT_MINUTES || process.env.APPSTATE_SAVE_INTERVAL_MINUTES) || 3)),
+  mqttReconnectGraceSeconds: Math.max(30, Math.min(600, Number(process.env.MQTT_RECONNECT_GRACE_SECONDS) || 120)),
   prefixes: parsePrefixes(process.env.BOT_PREFIXES),
   timezone: process.env.BOT_TIMEZONE || 'Africa/Tunis',
   logLevel: process.env.LOG_LEVEL || 'info',
@@ -2275,6 +2477,32 @@ function resolveCommand(parsed, registry) {
   return null;
 }
 
+const COMMAND_TYPING_DELAY_MS = 3000;
+
+async function beginTypingDelay(ctx, group) {
+  let stopTyping = null;
+  if (group?.typingEnabled && typeof ctx.api.sendTypingIndicator === 'function') {
+    try {
+      const indicator = await apiCall(ctx.api, 'sendTypingIndicator', ctx.threadID);
+      if (typeof indicator === 'function') stopTyping = indicator;
+    } catch (err) {
+      logger.warn('Could not activate the Messenger typing indicator; the response delay will still be applied.', {
+        threadID: ctx.threadID,
+        error: err.message,
+      });
+    }
+  }
+
+  await new Promise(resolve => setTimeout(resolve, COMMAND_TYPING_DELAY_MS));
+  return stopTyping;
+}
+
+async function endTypingIndicator(stopTyping) {
+  if (typeof stopTyping !== 'function') return;
+  try { await Promise.resolve(stopTyping()); }
+  catch { /* best effort */ }
+}
+
 function makeContext({ event, api, db, config, jobs, registry, currentUserID, connected, ctxState }) {
   const parsed = parseCommand(event.body || event.text || '', config.prefixes);
   if (!parsed) return null;
@@ -2311,26 +2539,36 @@ async function handleIncoming({ event, api, db, config, jobs, registry, currentU
   if (db.get('locked') && !(isUnlock && ctx.isPrimary)) return;
   if (db.get('maintenance') && !(isUnlock && ctx.isPrimary)) return;
 
+  const group = db.group(ctx.threadID);
+
   if (!ctx.isDeveloper) {
     if (!db.wasDenied(ctx.senderID)) {
       await db.markDenied(ctx.senderID);
-      await ctx.reply(error('Access denied. This command is reserved for TAHA BOT developers.'));
+      let stopTyping = null;
+      try {
+        stopTyping = await beginTypingDelay(ctx, group);
+        await ctx.reply(error('Access denied. This command is reserved for TAHA BOT developers.'));
+      } finally {
+        await endTypingIndicator(stopTyping);
+      }
     }
     return;
   }
   if (command.permission === 'Primary developer only' && !ctx.isPrimary) {
-    await ctx.reply(error('Primary developer only.'));
+    let stopTyping = null;
+    try {
+      stopTyping = await beginTypingDelay(ctx, group);
+      await ctx.reply(error('Primary developer only.'));
+    } finally {
+      await endTypingIndicator(stopTyping);
+    }
     return;
   }
 
   const start = Date.now();
-  const group = db.group(ctx.threadID);
   let stopTyping = null;
   try {
-    if (group.typingEnabled && typeof api.sendTypingIndicator === 'function') {
-      const indicator = await apiCall(api, 'sendTypingIndicator', ctx.threadID);
-      if (typeof indicator === 'function') stopTyping = indicator;
-    }
+    stopTyping = await beginTypingDelay(ctx, group);
     await command.handler(ctx);
     await db.increment('executed');
   } catch (err) {
@@ -2340,9 +2578,7 @@ async function handleIncoming({ event, api, db, config, jobs, registry, currentU
   } finally {
     const latency = Date.now() - start;
     ctxState.maxLatency = Math.max(ctxState.maxLatency || 0, latency);
-    if (typeof stopTyping === 'function') {
-      try { await Promise.resolve(stopTyping()); } catch { /* best effort */ }
-    }
+    await endTypingIndicator(stopTyping);
   }
 }
 
@@ -2428,7 +2664,7 @@ async function connectMessenger(config) {
         appStateFile: path.resolve(config.appStateFile), volumeMount,
       });
     } else {
-      logger.info('AppState file is inside the Railway persistent Volume.', { volumeMount, intervalMinutes: config.appStateSaveIntervalMinutes });
+      logger.info('AppState file is inside the Railway persistent Volume.', { volumeMount, intervalMinutes: config.sessionHeartbeatMinutes });
     }
   } else {
     logger.warn('No Railway persistent Volume was detected. AppState snapshots may be lost after redeploy. Attach a Volume and set APPSTATE_FILE to its mount path.');
@@ -2470,12 +2706,14 @@ async function connectMessenger(config) {
     if (typeof api.getAppState !== 'function') {
       throw new Error('The Messenger adapter does not expose getAppState(); current session cannot be snapshotted.');
     }
-    const snapshot = await Promise.resolve(api.getAppState());
-    if (!Array.isArray(snapshot) || !snapshot.length || snapshot.some(cookie => !cookie || typeof cookie !== 'object')) {
-      throw new Error('getAppState() returned an invalid or empty cookie array; refusing to overwrite the last saved session.');
-    }
     const file = path.resolve(config.appStateFile);
     const task = async () => {
+      // Read the cookie jar only when this write reaches the queue. This ensures
+      // a slower earlier save cannot overwrite a newer snapshot captured later.
+      const snapshot = await Promise.resolve(api.getAppState());
+      if (!Array.isArray(snapshot) || !snapshot.length || snapshot.some(cookie => !cookie || typeof cookie !== 'object')) {
+        throw new Error('getAppState() returned an invalid or empty cookie array; refusing to overwrite the last saved session.');
+      }
       await atomicWrite(file, JSON.stringify(snapshot));
       logger.info('Facebook AppState snapshot saved to persistent storage.', { reason, cookieCount: snapshot.length });
     };
@@ -2487,12 +2725,13 @@ async function connectMessenger(config) {
   // Preserve the latest cookie snapshot immediately after a successful login.
   await saveAppState('login');
 
-  const mqtt = api.listenMqtt();
-  if (!mqtt || typeof mqtt.on !== 'function') {
-    throw new Error('Could not start the Messenger realtime listener.');
+  if (typeof api.listenMqtt !== 'function') {
+    throw new Error('Messenger library did not expose listenMqtt().');
   }
-  logger.info('Messenger listener started.', { currentUserID: currentUserID || 'unknown' });
-  return { api, mqtt, currentUserID, saveAppState };
+  logger.info('Messenger API authenticated; MQTT listener startup is delegated to the recovery supervisor.', {
+    currentUserID: currentUserID || 'unknown',
+  });
+  return { api, currentUserID, saveAppState };
 }
 
 function apiCall(api, method, ...args) {
@@ -2593,7 +2832,7 @@ async function scanThread(api, db, threadID, botUserID, primaryID) {
     const rawNicknames = info?.nicknames || info?.participantNicknames || {};
     const current = rawNicknames instanceof Map ? Object.fromEntries(rawNicknames.entries()) : rawNicknames;
     for (const [userID, expected] of Object.entries(g.nickProtection.members || {})) {
-      if (String(userID) === String(botUserID) || String(userID) === String(primaryID)) continue;
+      if (String(userID) === String(botUserID) || (String(userID) === String(primaryID) && g.nickProtection.allowPrimary !== true)) continue;
       if (String(current[userID] || '') !== String(expected)) {
         await apiCall(api, 'changeNickname', expected, threadID, userID);
         await sleep(700);
