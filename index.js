@@ -2397,6 +2397,11 @@ class Database {
         hellMode: false,
       };
     }
+    // Migrate groups created by older builds: an absent value means ON.
+    // Keep an explicit false value so the .typing off command still works.
+    if (typeof this.state.groups[id].typingEnabled !== 'boolean') {
+      this.state.groups[id].typingEnabled = true;
+    }
     return this.state.groups[id];
   }
   touchThread(threadID) {
@@ -2481,14 +2486,37 @@ const COMMAND_TYPING_DELAY_MS = 3000;
 
 async function beginTypingDelay(ctx, group) {
   let stopTyping = null;
-  if (group?.typingEnabled && typeof ctx.api.sendTypingIndicator === 'function') {
-    try {
-      const indicator = await apiCall(ctx.api, 'sendTypingIndicator', ctx.threadID);
-      if (typeof indicator === 'function') stopTyping = indicator;
-    } catch (err) {
-      logger.warn('Could not activate the Messenger typing indicator; the response delay will still be applied.', {
+  const typingEnabled = group?.typingEnabled !== false;
+
+  if (typingEnabled) {
+    const sendTyping = ctx.api?.sendTypingIndicator;
+    if (typeof sendTyping === 'function') {
+      try {
+        // FCA Unofficial documents sendTypingIndicator(threadID) as returning
+        // its own stop function. Call it directly (without apiCall's generic
+        // callback adapter) so that return value is not lost or misread.
+        let result = sendTyping.call(ctx.api, ctx.threadID);
+        if (result && typeof result.then === 'function') result = await result;
+
+        if (typeof result === 'function') {
+          stopTyping = result;
+        } else if (result && typeof result.end === 'function') {
+          stopTyping = () => result.end();
+        }
+
+        logger.info('Messenger typing indicator request issued.', {
+          threadID: ctx.threadID,
+          stopCallbackAvailable: typeof stopTyping === 'function',
+        });
+      } catch (err) {
+        logger.warn('Could not activate the Messenger typing indicator; the response delay will still be applied.', {
+          threadID: ctx.threadID,
+          error: err?.message || String(err),
+        });
+      }
+    } else {
+      logger.warn('FCA adapter does not expose sendTypingIndicator(); the response delay will still be applied.', {
         threadID: ctx.threadID,
-        error: err.message,
       });
     }
   }
@@ -2500,7 +2528,11 @@ async function beginTypingDelay(ctx, group) {
 async function endTypingIndicator(stopTyping) {
   if (typeof stopTyping !== 'function') return;
   try { await Promise.resolve(stopTyping()); }
-  catch { /* best effort */ }
+  catch (err) {
+    logger.warn('Could not stop the Messenger typing indicator cleanly.', {
+      error: err?.message || String(err),
+    });
+  }
 }
 
 function makeContext({ event, api, db, config, jobs, registry, currentUserID, connected, ctxState }) {
